@@ -1,5 +1,7 @@
 # TV Mode for Steam Big Picture
 
+<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/9ef36076-30d0-446e-8004-10917ba7991e" />
+
 **Your whole library on your PC. Just the good stuff on your TV.**
 
 TV Mode is a [Millennium](https://steambrew.app) plugin that turns Steam Big
