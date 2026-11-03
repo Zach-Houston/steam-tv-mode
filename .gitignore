@@ -1,0 +1,12 @@
+# dependencies / build output
+node_modules/
+/.millennium
+.millennium/lsp/
+
+# local runtime data — never commit
+tvmode.log
+icons/
+reset-lock
+
+# stray scratch file (safe to delete)
+.gitignore.tmp

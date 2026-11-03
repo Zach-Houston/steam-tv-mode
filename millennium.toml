@@ -1,0 +1,30 @@
+[plugin]
+id = "com.zach.tvmode"
+name = "TV Mode"
+version = "0.10.1"
+author = "Zach-Houston"
+description = "Big Picture TV mode: shows only collections whose names start with 'TV' and hides playtime / last played."
+
+[assets]
+resources = ["resources/**/*"]
+
+[backend]
+entry = "backend/main.lua"
+sources = ["backend/**/*.lua"]
+
+[frontend]
+entry = "frontend/index.tsx"
+
+[compiler]
+# auto = detect the Millennium install and drop the built plugin straight into it
+output_path = "auto"
+
+[dev]
+auto_restart = true
+reload_steamui_when = "both"
+
+[logger]
+padding = 0
+backend_prefix  = "TV-BCK"
+frontend_prefix = "TV-FRT"
+webview_prefix  = "TV-WEB"
