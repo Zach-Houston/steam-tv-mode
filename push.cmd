@@ -7,7 +7,7 @@ rem Usage: push.cmd ["commit summary"]
 cd /d "%~dp0"
 where git >nul 2>&1 || (echo Git is not installed: https://git-scm.com/download/win & pause & exit /b 1)
 set "MSG=%~1"
-if "%MSG%"=="" set "MSG=Install/download states, running screen, achievements restyle, Steam menu and Updates fixes"
+if "%MSG%"=="" set "MSG=Update TV Mode"
 set "AUTHOR=-c user.name=Zach-Houston -c user.email=Zach-Houston@users.noreply.github.com"
 
 git fetch -q origin
@@ -23,11 +23,6 @@ echo.
 git diff --cached --quiet
 if errorlevel 1 (
 	git %AUTHOR% commit -q -m "%MSG%" ^
- -m "- Game page: Install button (outline) for games not installed on this PC, download progress (queued/downloading/paused/installing), Launching/Playing state, Steam's install pop-up without its game page behind it" ^
- -m "- Carousel: status line for downloads / Not Installed / Playing, wrap-around between collections, faster camera, instant return to the last game, TV prefix dropped from collection names" ^
- -m "- Game page: smaller achievements card without View all; Updates with images, remembered position, B closes panels and returns focus to Updates" ^
- -m "- Steam achievements page (Big Picture and in-game overlay): TV styling, rarity colours, no Compare to / search boxes / avatar / playtime, controller can't reach hidden boxes" ^
- -m "- Steam menu: in-game entry reachable, game options trimmed (View game details, Guides, Notes, Game Recording); hidden text boxes disabled so the keyboard can't pop up" ^
  -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" ^
  -m "Claude-Session: https://claude.ai/code/session_01JgyaRQjxq1QaBpEJLZz5Yk"
 ) else (
