@@ -1,8 +1,9 @@
 import { definePlugin, Field } from 'millennium';
-import { makeTvHome, TvRow } from './tvhome';
-import { AchievementItem, NewsItem, makeTvGame } from './tvgame';
+import { heroSources, makeTvHome, TvRow } from './tvhome';
+import { AchievementItem, DownloadState, NewsItem, downloadLabel, makeTvGame } from './tvgame';
 import { createDesktopLock } from './lock';
 import { startMenuInjector } from './menu-cdp';
+import { ACH_ROUTE, styleAchievementsPage } from './achpage';
 
 /* ------------------------------------------------------------------ *
  * TV Mode v0.1.1
@@ -88,7 +89,7 @@ const LIBRARY_TAB_LABELS = new Set([
 ]);
 
 /** Labels whose surrounding block (label + value) should disappear. */
-const PLAYTIME_LABELS = /^(play\s?time|time played|last played|total played|playtime( on record)?|hours played)$/i;
+const PLAYTIME_LABELS = /^(play\s?time|time played|last played|total played|playtime( on record)?|hours played|(last|past) (two|2) weeks)$/i;
 /** Free-standing strings that are playtime on their own. */
 const PLAYTIME_TEXT = [
 	/^(you've\s+)?played\s+(for\s+)?[\d.,]+\s*(hours?|hrs?|minutes?|mins?)\b/i,
@@ -209,7 +210,7 @@ function readCollections(withCounts = false): CollectionNames {
 const norm = (s: string | null | undefined) => (s ?? '').replace(/\s+/g, ' ').trim();
 
 /** Hidden for these reasons = also made unfocusable, so the controller can't land on them. */
-const INERT_REASONS = new Set(['top-bar', 'search', 'settings-entry', 'wifi-original', 'library-tab', 'main-menu', 'footer']);
+const INERT_REASONS = new Set(['top-bar', 'search', 'settings-entry', 'wifi-original', 'library-tab', 'main-menu', 'footer', 'compare', 'avatar']);
 
 function hide(el: Element | null | undefined, reason: string) {
 	if (!el || el.hasAttribute(HIDDEN_ATTR)) return;
@@ -217,6 +218,10 @@ function hide(el: Element | null | undefined, reason: string) {
 	if (INERT_REASONS.has(reason)) {
 		el.setAttribute('inert', '');
 		el.setAttribute('tabindex', '-1');
+		// A hidden text box (the top bar's search) can still get Steam's focus, and A on it opens the
+		// on-screen keyboard. Disabled inputs can't take focus or be typed into.
+		const inputs = el.matches('input, textarea') ? [el] : Array.from(el.querySelectorAll('input, textarea'));
+		inputs.forEach((i) => ((i as HTMLInputElement).disabled = true));
 	}
 }
 
@@ -295,6 +300,8 @@ let sidebarLogged = false;
 
 /* Steam button menu: keep only these entries. */
 const MAIN_MENU_ALLOWED = new Set(['downloads', 'settings', 'power']);
+/* A running game's entry in the Steam menu: these options are dropped. */
+const GAME_MENU_HIDDEN = ['view game details', 'guides', 'notes', 'game recording'];
 const MAIN_MENU_KNOWN = new Set(['home', 'library', 'store', 'friends & chat', 'media', 'downloads', 'settings', 'power', 'web browser', 'steam deck']);
 
 let mainMenuHidden = 0;
@@ -514,7 +521,8 @@ function trimHeader(doc: Document) {
 		topBarDescribed = true;
 		log('top bar items', items.map(describe));
 	}
-	// The whole top bar goes; its clock, controller and Wi-Fi move to a strip in the bottom bar.
+	// No top bar anywhere; the time shows top-right instead. Steam screens' reserved space
+	// for it is removed by the PadForHeader rule in attach().
 	updateStatusBar(doc, entry!.header);
 	hide(entry!.header, 'top-bar');
 }
@@ -557,6 +565,9 @@ const STATUS_ID = 'tvmode-status';
 let statusTimer: ReturnType<typeof setInterval> | undefined;
 
 /* Status: just the time, top-right. Warnings appear beside it only when something is wrong. */
+/** Steam's Wi-Fi glyph, copied from its hidden top bar. */
+let steamWifiSvg: string | null = null;
+
 const WARN_ICONS = {
 	internet:
 		'<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 8.8a15 15 0 0 1 4.2-2.6M10.3 5.1A15 15 0 0 1 22 8.8M5 12.6a10 10 0 0 1 3.4-2.1M15 10.4a10 10 0 0 1 4 2.2M8.5 16.1a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r=".8" fill="currentColor"/><path d="M3 3l18 18"/></svg>',
@@ -580,6 +591,11 @@ function updateStatusBar(doc: Document, header: Element) {
 		win?.addEventListener('offline', refresh);
 	}
 	// Steam only shows its "Controller Details" item while a controller is connected.
+	const wifiItem = Array.from(header.querySelectorAll('[aria-label]')).find((el) =>
+		/internet|network|wi-?fi/i.test(el.getAttribute('aria-label') ?? ''),
+	);
+	const wifiSvg = wifiItem?.querySelector('svg');
+	if (wifiSvg) steamWifiSvg = wifiSvg.outerHTML;
 	const hasController = Array.from(header.querySelectorAll('[aria-label]')).some((el) =>
 		/controller/i.test(el.getAttribute('aria-label') ?? ''),
 	);
@@ -589,15 +605,26 @@ function updateStatusBar(doc: Document, header: Element) {
 	if (bar.getAttribute('data-sig') === sig) return;
 	bar.setAttribute('data-sig', sig);
 	bar.replaceChildren();
-	// Icon only: the crossed-out glyph says enough.
-	const warn = (icon: string) => {
+	// Steam's own glyphs, white, with a strike through them.
+	const warn = (svg: string) => {
 		const el = doc.createElement('span');
-		el.style.cssText = 'display:flex;align-items:center;color:#f2b84c;';
-		el.innerHTML = icon;
+		el.style.cssText = 'position:relative;display:inline-flex;width:28px;height:28px;';
+		const glyph = doc.createElement('span');
+		glyph.style.cssText = 'display:inline-flex;width:100%;height:100%;filter:brightness(0) invert(1);';
+		glyph.innerHTML = svg;
+		glyph.querySelectorAll('svg').forEach((g) => {
+			g.removeAttribute('width');
+			g.removeAttribute('height');
+			(g as SVGElement).style.cssText = 'width:100%;height:100%;';
+		});
+		const strike = doc.createElement('span');
+		strike.style.cssText =
+			'position:absolute;left:-2px;right:-2px;top:50%;height:2.5px;margin-top:-1.25px;background:#fff;border-radius:2px;transform:rotate(-45deg);box-shadow:0 0 0 1.5px rgba(0,0,0,.55);';
+		el.append(glyph, strike);
 		bar!.appendChild(el);
 	};
-	if (!online) warn(WARN_ICONS.internet);
-	if (!hasController) warn(WARN_ICONS.controller);
+	if (!online) warn(steamWifiSvg ?? WARN_ICONS.internet);
+	if (!hasController) warn(stockIcons.controller ?? WARN_ICONS.controller);
 	const clock = doc.createElement('span');
 	clock.textContent = time;
 	bar.appendChild(clock);
@@ -622,6 +649,16 @@ function sweep(root: Node, collections: CollectionNames) {
 		trimSettingsSidebar(doc);
 		trimMainMenu(doc);
 		trimFooter(doc);
+	}
+	// Text boxes Steam re-creates inside hidden areas: keep them disabled (see hide()).
+	doc.querySelectorAll<HTMLInputElement>(`[${HIDDEN_ATTR}] input:not([disabled]), [${HIDDEN_ATTR}] textarea:not([disabled])`).forEach((i) => {
+		const reason = i.closest(`[${HIDDEN_ATTR}]`)?.getAttribute(HIDDEN_ATTR) ?? '';
+		if (INERT_REASONS.has(reason)) i.disabled = true;
+	});
+	try {
+		styleAchievementsPage(doc, currentRoute(), hide, log);
+	} catch (e) {
+		log('achievements styling failed', String(e));
 	}
 	const onLibraryPage = currentRoute().toLowerCase().startsWith('/library');
 	for (const tn of textNodes(root)) {
@@ -655,6 +692,102 @@ const SWEEP_BUDGET_MS = 100;
 const SWEEP_DEBOUNCE_MS = 200;
 const COLLECTION_REFRESH_MS = 5000;
 
+/* ------------------------------------------------------------------ *
+ * Steam's own row-move sound. Steam plays a sound when its navigation moves focus between rows,
+ * but not when we move focus ourselves (the carousel wrap). We watch what Steam plays right after
+ * a normal up/down move and replay exactly that on a wrap, so both sound the same.
+ * ------------------------------------------------------------------ */
+type CapturedSound =
+	| { kind: 'media'; win: any; src: string; volume: number }
+	| { kind: 'buffer'; ctx: any; buffer: any; dest: any };
+let lastVerticalMoveAt = 0;
+let rowMoveSound: CapturedSound | null = null;
+let replayingSound = false;
+const loggedSounds = new Set<string>();
+
+function onSteamSound(snd: CapturedSound) {
+	if (replayingSound) return;
+	const since = Date.now() - lastVerticalMoveAt;
+	const key = snd.kind === 'media' ? snd.src : `buffer ${snd.buffer?.duration?.toFixed?.(3)}s`;
+	if (loggedSounds.size < 12 && !loggedSounds.has(key)) {
+		loggedSounds.add(key);
+		log('steam sound', key, 'ms after up/down:', since);
+	}
+	if (since < 250) rowMoveSound = snd;
+}
+
+function installSoundHook(win: any) {
+	if (!win || win.__tvmodeSoundHook) return;
+	win.__tvmodeSoundHook = true;
+	try {
+		const dests = new WeakMap<object, any>();
+		const nodeProto = win.AudioNode?.prototype;
+		const origConnect = nodeProto?.connect;
+		if (origConnect) {
+			nodeProto.connect = function (this: any, dest: any, ...rest: any[]) {
+				try {
+					if (win.AudioBufferSourceNode && this instanceof win.AudioBufferSourceNode && !dests.has(this)) dests.set(this, dest);
+				} catch {
+					/* ignore */
+				}
+				return origConnect.call(this, dest, ...rest);
+			};
+		}
+		const srcProto = win.AudioBufferSourceNode?.prototype;
+		const origStart = srcProto?.start;
+		if (origStart) {
+			srcProto.start = function (this: any, ...args: any[]) {
+				try {
+					if (this.buffer) onSteamSound({ kind: 'buffer', ctx: this.context, buffer: this.buffer, dest: dests.get(this) });
+				} catch {
+					/* ignore */
+				}
+				return origStart.apply(this, args);
+			};
+		}
+		const mediaProto = win.HTMLMediaElement?.prototype;
+		const origPlay = mediaProto?.play;
+		if (origPlay) {
+			mediaProto.play = function (this: any, ...args: any[]) {
+				try {
+					const src = this.currentSrc || this.src;
+					if (src && /\/sounds\//.test(src)) onSteamSound({ kind: 'media', win, src, volume: this.volume });
+				} catch {
+					/* ignore */
+				}
+				return origPlay.apply(this, args);
+			};
+		}
+	} catch (e) {
+		log('sound hook failed', String(e));
+	}
+}
+
+function replayRowMoveSound() {
+	const snd = rowMoveSound;
+	if (!snd) {
+		log('carousel wrap: no row-move sound captured yet');
+		return;
+	}
+	replayingSound = true;
+	try {
+		if (snd.kind === 'media') {
+			const a = new snd.win.Audio(snd.src);
+			a.volume = snd.volume;
+			a.play()?.catch?.(() => {});
+		} else {
+			const n = snd.ctx.createBufferSource();
+			n.buffer = snd.buffer;
+			n.connect(snd.dest ?? snd.ctx.destination);
+			n.start();
+		}
+	} catch (e) {
+		log('carousel wrap: replay failed', String(e));
+	} finally {
+		replayingSound = false;
+	}
+}
+
 function attach(doc: Document) {
 	if (attached.has(doc) || !doc.body) return;
 	attached.add(doc);
@@ -669,10 +802,16 @@ function attach(doc: Document) {
 	}
 	if (CONFIG.desktopLock) desktopLock.relock();
 	if (doc.defaultView) watchRoutes(doc.defaultView);
+	installSoundHook(window);
+	installSoundHook(doc.defaultView);
 
 	const style = doc.createElement('style');
 	style.id = STYLE_ID;
-	style.textContent = `[${HIDDEN_ATTR}] { display: none !important; }`;
+	style.textContent =
+		`[${HIDDEN_ATTR}] { display: none !important; }\n` +
+		// Steam pages reserve 40px top and bottom for Big Picture's bars; with the top bar gone that
+		// shows as black strips. Let them fill the screen (the bottom bar, where shown, overlays it).
+		`[class~="PadForHeader"] { padding-top: 0 !important; padding-bottom: 0 !important; }`;
 	doc.head.appendChild(style);
 
 	let collections = readCollections();
@@ -730,16 +869,19 @@ function attach(doc: Document) {
 	});
 	observer.observe(doc.body, { childList: true, subtree: true });
 
-	// Controller input arrives as Steam "vgp_" events on the focused element. Blocking "up" from the
-	// carousel's top row stops focus from ever reaching the top bar (search, icons).
+	// Controller input arrives as Steam "vgp_" events on the focused element. On the carousel,
+	// up from the top row wraps to the bottom row and down from the bottom row wraps to the top,
+	// so focus never reaches the hidden top bar and there's no "dead end" sound.
 	const DIR_UP = 9; // Steam's EGamepadButton.DIR_UP
-	const LSTICK_UP = 23; // left stick up as a navigation input (logged below to verify)
+	const DIR_DOWN = 10; // Steam's EGamepadButton.DIR_DOWN
+	const LSTICK_UP = 23;
+	const LSTICK_DOWN = 24;
+	const BTN_A = 1; // EGamepadButton.OK
 	let vgpLogged = 0;
-	const inTopRow = (el: Element | null) => {
-		const tile = el?.closest?.('.tvm-tile');
-		const firstRow = doc.querySelector('.tvm-row');
-		return !!tile && !!firstRow && firstRow.contains(tile);
-	};
+	let lastWrap = 0;
+	let lastDir: 'up' | 'down' | 'other' = 'other';
+	let achLogged = 0;
+	const lastTileInRow = new WeakMap<Element, HTMLElement>();
 	const focusedTile = (): Element | null =>
 		doc.querySelector('.tvm-root .tvm-tile.gpfocus') ?? (doc.activeElement?.closest?.('.tvm-tile') ?? null);
 	for (const type of ['vgp_onbuttondown', 'vgp_onbuttonup']) {
@@ -751,18 +893,101 @@ function attach(doc: Document) {
 					vgpLogged++;
 					log('controller input', { button: detail.button, source: detail.source, target: describe(e.target as Element) });
 				}
+				// A on something hidden (the top bar's search box, which Steam's focus can still reach)
+				// would open search and the keyboard. Swallow it and put focus back on the screen.
+				if (detail.button === BTN_A) {
+					const focused = Array.from(doc.querySelectorAll<HTMLElement>('.gpfocus')).pop() ?? null;
+					const header = headerCache.get(doc)?.header;
+					const hiddenFocus =
+						!!focused && (!!focused.closest(`[${HIDDEN_ATTR}]`) || (!!header && header.contains(focused) && !focused.closest('[data-tvmode-copy]')));
+					if (hiddenFocus) {
+						e.preventDefault();
+						e.stopImmediatePropagation();
+						if (type === 'vgp_onbuttondown') {
+							const back =
+								doc.querySelector<HTMLElement>('.tvg-panel .tvg-row, .tvg-panel .tvg-para') ??
+								doc.querySelector<HTMLElement>('.tvg-play') ??
+								(lastTile?.isConnected ? lastTile : doc.querySelector<HTMLElement>('.tvm-tile')) ??
+								(lastGood?.isConnected ? lastGood : null);
+							log('A on hidden element blocked', describe(focused!), '→', back ? describe(back) : 'nothing');
+							back?.focus();
+						}
+						return;
+					}
+				}
+				if (type === 'vgp_onbuttondown') {
+					const b = detail.button;
+					lastDir = b === DIR_UP || b === LSTICK_UP ? 'up' : b === DIR_DOWN || b === LSTICK_DOWN ? 'down' : 'other';
+				}
+				// Steam's achievements page. Above the tabs is only the hidden top bar (its search box pops
+				// up the keyboard), and between the tabs and the first achievement sits the removed
+				// "Compare to..." box. Steer around both: up from the tabs stops, down from the tabs goes
+				// straight to the first achievement, up from the first achievement goes back to the tabs.
+				if (ACH_ROUTE.test(currentRoute())) {
+					const b = detail.button;
+					const isUp = b === DIR_UP || b === LSTICK_UP;
+					const isDown = b === DIR_DOWN || b === LSTICK_DOWN;
+					if (isUp || isDown) {
+						const focused = Array.from(doc.querySelectorAll<HTMLElement>('.gpfocus')).pop() ?? null;
+						if (achLogged < 30 && type === 'vgp_onbuttondown') {
+							achLogged++;
+							log('ach nav', isUp ? 'up' : 'down', focused ? describe(focused) : 'no gpfocus', 'active:', doc.activeElement ? describe(doc.activeElement) : '-');
+						}
+						const inTabs = !!focused?.closest('.TabRow') || !!doc.querySelector('.TabRow .gpfocus');
+						const firstItem = doc.querySelector<HTMLElement>('[data-tvm-ach-item]');
+						const onFirst = !!firstItem && !!focused && (focused === firstItem || firstItem.contains(focused));
+						let to: HTMLElement | null | undefined;
+						let stop = false;
+						// Above the content area there's only the tabs and the progress header; nothing to go up to.
+						const inContent = !!focused?.closest('.TabContents, .AchievementList');
+						if (isUp && (inTabs || !inContent)) stop = true;
+						else if (inTabs && isDown) to = firstItem;
+						else if (onFirst && isUp) to = doc.querySelector<HTMLElement>('.TabRow .Tab.Selected') ?? doc.querySelector<HTMLElement>('.TabRow .Tab');
+						if (stop || to) {
+							e.preventDefault();
+							e.stopImmediatePropagation();
+							if (to && type === 'vgp_onbuttondown') to.focus();
+							return;
+						}
+					}
+				}
 				if (!currentRoute().toLowerCase().startsWith(TV_ROUTE)) return;
-				if (detail.button !== DIR_UP && detail.button !== LSTICK_UP) return;
+				const up = detail.button === DIR_UP || detail.button === LSTICK_UP;
+				const down = detail.button === DIR_DOWN || detail.button === LSTICK_DOWN;
+				if (!up && !down) return;
 				const tile = focusedTile() ?? (e.target as Element);
-				if (!inTopRow(tile)) return;
+				const row = tile?.closest?.('.tvm-row');
+				if (!row || !tile?.closest?.('.tvm-tile')) return;
+				const rows = Array.from(doc.querySelectorAll('.tvm-root .tvm-row'));
+				const idx = rows.indexOf(row);
+				if (idx < 0) return;
+				if (up ? idx !== 0 : idx !== rows.length - 1) {
+					// Normal move: Steam handles it; note the time so we can learn its sound.
+					if (type === 'vgp_onbuttondown') lastVerticalMoveAt = Date.now();
+					return;
+				}
 				e.preventDefault();
 				e.stopImmediatePropagation();
+				if (type !== 'vgp_onbuttondown' || rows.length < 2) return;
+				const now = Date.now();
+				if (now - lastWrap < 250) return; // a held stick shouldn't spin through the rows
+				lastWrap = now;
+				const target = rows[up ? rows.length - 1 : 0];
+				const remembered = lastTileInRow.get(target);
+				const dest = remembered?.isConnected && target.contains(remembered) ? remembered : target.querySelector<HTMLElement>('.tvm-tile');
+				if (!dest) return;
+				dest.focus();
+				replayRowMoveSound();
+				setTimeout(() => {
+					if (!dest.classList.contains('gpfocus')) log('carousel wrap: focus did not take', describe(dest));
+				}, 150);
 			},
 			true,
 		);
 	}
 
 	let lastTile: HTMLElement | null = null;
+	let lastGood: HTMLElement | null = null;
 	const loggedFocus = new Set<string>();
 	doc.addEventListener(
 		'focusin',
@@ -771,21 +996,45 @@ function attach(doc: Document) {
 			if (!t) return;
 			if (t.closest('.tvm-root')) {
 				const tile = t.closest<HTMLElement>('.tvm-tile');
-				if (tile) lastTile = tile;
+				if (tile) {
+					lastTile = tile;
+					const row = tile.closest('.tvm-row');
+					if (row) lastTileInRow.set(row, tile);
+				}
 				return;
 			}
 			// Only pull focus back when it lands on something hidden (top bar, search…).
 			// Menus and dialogs (power menu, etc.) must keep their focus.
 			const header = headerCache.get(doc)?.header;
 			const inHidden = !!t.closest(`[${HIDDEN_ATTR}]`) || (!!header && header.contains(t) && !t.closest('[data-tvmode-copy]'));
-			if (!inHidden) return;
+			if (ACH_ROUTE.test(currentRoute()) && achLogged < 30) {
+				achLogged++;
+				log('ach focus', describe(t), 'hidden:', inHidden, 'in TabRow:', !!t.closest('.TabRow'));
+			}
+			if (!inHidden) {
+				lastGood = t;
+				return;
+			}
 			const desc = describe(t);
 			if (!loggedFocus.has(desc)) {
 				loggedFocus.add(desc);
 				log('focus guard: focus left the carousel to', desc, 'hidden:', inHidden);
 			}
+			// Steam's achievements page: skip over the removed "Compare to..." entry in the direction
+			// of travel (it sits between the tabs and the first achievement).
+			if (ACH_ROUTE.test(currentRoute())) {
+				const next =
+					lastDir === 'up'
+						? doc.querySelector<HTMLElement>('.TabRow .Tab.Selected') ?? doc.querySelector<HTMLElement>('.TabRow .Tab')
+						: doc.querySelector<HTMLElement>('[data-tvm-ach-item]');
+				const target = next ?? (lastGood?.isConnected ? lastGood : null);
+				if (target) setTimeout(() => target.focus(), 0);
+				else t.blur?.();
+				return;
+			}
 			const back = lastTile?.isConnected ? lastTile : doc.querySelector<HTMLElement>('.tvm-tile');
 			if (back) setTimeout(() => back.focus(), 0);
+			else if (lastGood?.isConnected) setTimeout(() => lastGood!.focus(), 0);
 			else t.blur?.();
 		},
 		true,
@@ -1087,12 +1336,53 @@ function showCover(doc: Document) {
 	setTimeout(hideCover, 4000);
 }
 
+function hideCoverNow() {
+	const el = coverEl;
+	if (!el) return;
+	coverEl = null;
+	el.remove();
+}
+
+/** Steam's own page for a TV game, which TV Mode always replaces with its own. */
+function isSteamTvGamePage(route: string): boolean {
+	const m = route.match(/^\/library\/app\/(\d+)\/?$/i);
+	return !!m && tvApps.has(m[1]);
+}
+
 function hideCover() {
 	const el = coverEl;
 	if (!el) return;
 	coverEl = null;
 	el.style.opacity = '0';
 	setTimeout(() => el.remove(), 300);
+}
+
+/** Diagnostics: what is drawn along the top and bottom edges of the screen. */
+const edgesLogged = new Set<string>();
+function logEdges(doc: Document, route: string) {
+	const key = route.replace(/\d+/g, '#');
+	if (edgesLogged.has(key)) return;
+	edgesLogged.add(key);
+	const win = doc.defaultView;
+	if (!win) return;
+	const w = win.innerWidth;
+	const h = win.innerHeight;
+	const at = (x: number, y: number) => {
+		const el = doc.elementFromPoint(x, y);
+		if (!el) return 'nothing';
+		const chain: string[] = [];
+		for (let e: Element | null = el, i = 0; e && i < 5; e = e.parentElement, i++) {
+			const cs = win.getComputedStyle(e);
+			const r = e.getBoundingClientRect();
+			chain.push(
+				`${e.tagName.toLowerCase()}.${(e.getAttribute('class') ?? '').split(/\s+/).filter((c) => /^[A-Z]/.test(c)).slice(0, 2).join('.')}` +
+					` [${Math.round(r.top)}-${Math.round(r.bottom)}] bg=${cs.backgroundColor} pad=${cs.paddingTop}/${cs.paddingBottom}` +
+					(e.closest('[' + HIDDEN_ATTR + ']') ? ' HIDDEN-ANCESTOR' : ''),
+			);
+		}
+		return chain;
+	};
+	log('edges on', key, { size: `${w}x${h}`, top: at(w / 2, 6), belowTop: at(w / 2, 70), bottom: at(w / 2, h - 6), aboveBottom: at(w / 2, h - 70) });
 }
 
 /** Redirect history, to stop if something keeps bouncing (loop guard). */
@@ -1165,7 +1455,25 @@ function watchRoutes(_win: Window) {
 			});
 		}
 		const v = judge(route);
-		if (v.allow && route && coverEl) hideCover();
+		if (v.allow && route && coverEl && !isSteamTvGamePage(route)) hideCover();
+		if (CONFIG.lockdown) steamGamePageToTv(route);
+		try {
+			updateRunningScreen(route);
+		} catch (e) {
+			log('running screen failed', String(e));
+		}
+		if (changed && bpmDoc && CONFIG.lockdown) {
+			try {
+				trimHeader(bpmDoc);
+				trimFooter(bpmDoc);
+			} catch {
+				/* ignore */
+			}
+			if (/controllerconfigurator|achievements|properties/i.test(route)) {
+				const doc = bpmDoc;
+				setTimeout(() => logEdges(doc, route), 1500);
+			}
+		}
 		if (changed && route.toLowerCase().startsWith('/settings') && bpmDoc && CONFIG.lockdown) {
 			setTimeout(() => bpmDoc && trimSettingsSidebar(bpmDoc), 150);
 		}
@@ -1272,7 +1580,9 @@ function readTvRows(): TvRow[] {
 				.filter((a) => a?.appid != null)
 				.map((a) => ({ appid: Number(a.appid), name: String(a.display_name ?? a.strDisplayName ?? a.appid) }))
 				.sort((x, y) => x.name.localeCompare(y.name));
-			rows.push({ id: String(c?.id ?? name), name, games });
+			// Display name without the "TV" prefix (e.g. "TV - Singleplayer" → "Singleplayer").
+			const display = name.replace(/^tv\b[\s\-–—·:|_]*/i, '').trim() || name;
+			rows.push({ id: String(c?.id ?? name), name: display, games });
 		}
 	} catch {
 		/* store not ready */
@@ -1296,7 +1606,37 @@ function currentGameApp(): number | null {
 	return tvGameApp;
 }
 
+/* Big Picture's own UI sounds (shipped with Steam), played in the Big Picture window. */
+const UI_SOUNDS = {
+	activate: 'deck_ui_default_activation.wav',
+	intoGame: 'deck_ui_into_game_detail.wav',
+	outOfGame: 'deck_ui_out_of_game_detail.wav',
+	launch: 'deck_ui_launch_game.wav',
+} as const;
+type UiSound = keyof typeof UI_SOUNDS;
+const soundFailed = new Set<string>();
+
+function playUiSound(name: UiSound) {
+	const file = UI_SOUNDS[name];
+	if (soundFailed.has(file)) return;
+	try {
+		const win: any = bpmDoc?.defaultView ?? window;
+		const audio = new win.Audio(`https://steamloopback.host/sounds/${file}`);
+		audio.volume = 0.8;
+		const p = audio.play();
+		p?.catch?.((e: unknown) => {
+			if (soundFailed.has(file)) return;
+			soundFailed.add(file);
+			log('ui sound failed', file, String(e));
+		});
+	} catch (e) {
+		soundFailed.add(file);
+		log('ui sound failed', file, String(e));
+	}
+}
+
 function openGame(appid: number) {
+	playUiSound('intoGame');
 	tvGameApp = appid;
 	try {
 		window.sessionStorage.setItem(GAME_KEY, String(appid));
@@ -1308,6 +1648,359 @@ function openGame(appid: number) {
 	} catch (e) {
 		log('open game failed', String(e));
 	}
+}
+
+/**
+ * Installed on THIS PC. Steam's overview also knows about other PCs on the account
+ * (per_client_data), and its general "installed" flag can be true because of those, so the
+ * local entry wins.
+ */
+const installLogged = new Set<number>();
+function installedHere(appid: number): boolean | null {
+	const ov = overview(appid);
+	if (!ov) return null;
+	let local: unknown;
+	let anyClient: unknown;
+	try {
+		local = ov.local_per_client_data?.installed;
+		const pcd = ov.per_client_data;
+		if (Array.isArray(pcd)) {
+			const here = pcd.find((c: any) => String(c?.clientid ?? '') === '0');
+			anyClient = here?.installed;
+		}
+	} catch {
+		/* ignore */
+	}
+	if (!installLogged.has(appid)) {
+		installLogged.add(appid);
+		log('install state', appid, { local, localClient: anyClient });
+	}
+	const ds = displayStatus(appid);
+	if (ds != null && (NOT_INSTALLED.has(ds) || FIRST_INSTALL.has(ds))) return false;
+	if (typeof local === 'boolean') return local;
+	if (typeof anyClient === 'boolean') return anyClient;
+	// Installed games always carry install info for this PC; an overview without any is a game
+	// that isn't installed here (seen with ELDEN RING: no local data at all).
+	return false;
+}
+
+let underlay: HTMLElement | null = null;
+let underlayLogged = false;
+/**
+ * A plain dark sheet placed directly beneath Steam's pop-up (same parent, same z-index, just
+ * before it), so the pop-up stays on top and Steam's game page underneath is never visible.
+ * It stays until we've left Steam's game page, so closing the pop-up doesn't flash the page.
+ */
+function showUnderlay(dialog: Element) {
+	if (underlay?.isConnected && underlay.nextElementSibling === dialog) return;
+	underlay?.remove();
+	const doc = dialog.ownerDocument;
+	const win = doc.defaultView ?? window;
+	const z = win.getComputedStyle(dialog).zIndex;
+	const d = doc.createElement('div');
+	d.id = 'tvmode-underlay';
+	// Same z-index as the pop-up (or none), inserted before it: drawn right underneath it.
+	d.style.cssText = `position:fixed;inset:0;background:#0a0c11;pointer-events:none;z-index:${z};`;
+	dialog.parentElement?.insertBefore(d, dialog);
+	underlay = d;
+	if (!underlayLogged) {
+		underlayLogged = true;
+		const chain: string[] = [];
+		for (let n: Element | null = dialog; n && chain.length < 8; n = n.parentElement) {
+			const cs = win.getComputedStyle(n);
+			chain.push(`${n.tagName.toLowerCase()}.${(n.getAttribute('class') ?? '').split(/\s+/).filter((c) => c.length < 18).join('.')} pos=${cs.position} z=${cs.zIndex} kids=${n.parentElement?.children.length ?? 0}`);
+		}
+		log('install pop-up underlay', 'dialog z:', z, chain);
+	}
+}
+
+function hideUnderlay() {
+	underlay?.remove();
+	underlay = null;
+}
+
+let installGraceUntil = 0;
+/**
+ * Big Picture's install pop-up is what Steam shows when you start a game that isn't installed
+ * (the desktop install wizard doesn't appear in Big Picture). Steam opens it over its own game
+ * page, so that page is masked the moment the pop-up appears, and we go back to TV Mode's game
+ * page once it closes.
+ */
+function openInstall(appid: number) {
+	playUiSound('activate');
+	installGraceUntil = Date.now() + 3000;
+	try {
+		(window as any).SteamClient?.Apps?.RunGame?.(String(appid), '', -1, 100);
+		log('install via launch', appid);
+	} catch (e) {
+		log('install failed', appid, String(e));
+		return;
+	}
+	if (bpmDoc) showCover(bpmDoc);
+	// Check often while this is going on, so the pop-up appearing and closing are both caught
+	// within a frame or two. Stops once we're back on TV Mode's page (or after a minute).
+	const start = Date.now();
+	const t = setInterval(() => {
+		const route = currentRoute();
+		const elapsed = Date.now() - start;
+		if (elapsed > 60000 || (elapsed > 1500 && !isSteamTvGamePage(route))) return clearInterval(t);
+		steamGamePageToTv(route);
+	}, 30);
+}
+
+let lastGamePageRedirect = 0;
+let lastDialogLog = 0;
+/** Steam sends some flows (launching an uninstalled game, cancelling install) to its own game page. */
+function steamGamePageToTv(route: string) {
+	const m = route.match(/^\/library\/app\/(\d+)\/?$/i);
+	if (!m || !tvApps.has(m[1]) || !bpmDoc) {
+		hideUnderlay();
+		return;
+	}
+	const now = Date.now();
+	const dialog = bpmDoc.querySelector('.ModalPosition, [class*="ModalPosition"], .GamepadDialogContent, [role="dialog"]');
+	if (dialog) {
+		showUnderlay(dialog);
+		hideCoverNow(); // the cover sits above everything, the pop-up included
+		installGraceUntil = 0; // the pop-up is up; once it closes, go straight back
+		if (now - lastDialogLog > 5000) {
+			lastDialogLog = now;
+			log('steam game page: hidden behind dialog until it closes', describe(dialog));
+		}
+		return;
+	}
+	// Right after asking for the install pop-up, Steam may show its page a moment before the pop-up.
+	if (now < installGraceUntil) return;
+	if (now - lastGamePageRedirect < 1000) return;
+	lastGamePageRedirect = now;
+	showCover(bpmDoc); // hides Steam's page (the pop-up is gone) until /tvgame is showing
+	const appid = Number(m[1]);
+	tvGameApp = appid;
+	try {
+		window.sessionStorage.setItem(GAME_KEY, String(appid));
+	} catch {
+		/* ignore */
+	}
+	try {
+		gamepadWindow()?.Navigate(TV_GAME_ROUTE, true);
+		log('steam game page → tv game page', appid);
+	} catch (e) {
+		log('steam game page redirect failed', String(e));
+	}
+}
+
+/* --------------------------- Downloads --------------------------- */
+
+function openDownloadsScreen() {
+	playUiSound('activate');
+	const w = gamepadWindow();
+	try {
+		if (typeof w?.Navigator?.Downloads === 'function') w.Navigator.Downloads();
+		else w?.Navigate('/downloads');
+		log('opened downloads');
+	} catch (e) {
+		log('open downloads failed', String(e));
+	}
+}
+
+/** Everything Steam says about this game's install/download state, logged on each button press. */
+function logPrimaryPress(button: string, appid: number) {
+	try {
+		const ov = overview(appid);
+		const item = dlItems.find((i) => Number(i?.appid) === appid);
+		log('primary button', button, appid, {
+			installedHere: installedHere(appid),
+			download: downloadState(appid),
+			queueItem: item ?? null,
+			queueSize: dlItems.length,
+			currentDownload: dlOverview ? { appid: dlOverview.update_appid, state: dlOverview.update_state, paused: dlOverview.paused } : null,
+			local: ov?.local_per_client_data ?? null,
+			perClient: ov?.per_client_data ?? null,
+			displayStatus: ov?.display_status,
+		});
+	} catch (e) {
+		log('primary button log failed', String(e));
+	}
+}
+
+let dlItems: any[] = [];
+let dlOverview: any = null;
+let dlWatching = false;
+let dlLoggedItems = false;
+let dlLoggedOverview = false;
+
+/** Subscribe once to Steam's download queue and current-download progress. */
+function watchDownloads() {
+	if (dlWatching) return;
+	dlWatching = true;
+	const D = (window as any).SteamClient?.Downloads;
+	if (!D) {
+		log('downloads: SteamClient.Downloads missing');
+		return;
+	}
+	try {
+		D.RegisterForDownloadItems?.((a: any, b: any) => {
+			const raw: any[] = Array.isArray(a) ? a : Array.isArray(b) ? b : [];
+			// Grouped per PC: [{ remote_client_id: "0", item_data: [...] }]. "0" is this PC.
+			const items: any[] = [];
+			for (const r of raw) {
+				if (Array.isArray(r?.item_data)) {
+					if (String(r.remote_client_id ?? '0') === '0') items.push(...r.item_data);
+				} else if (r?.appid != null) items.push(r);
+			}
+			dlItems = items;
+			if (!dlLoggedItems && items.length) {
+				dlLoggedItems = true;
+				log('downloads: items', items.slice(0, 3));
+			}
+		});
+	} catch (e) {
+		log('downloads: items register failed', String(e));
+	}
+	try {
+		D.RegisterForDownloadOverview?.((ov: any) => {
+			dlOverview = ov;
+			if (!dlLoggedOverview && ov && Number(ov.update_appid)) {
+				dlLoggedOverview = true;
+				log('downloads: overview', ov);
+			}
+		});
+	} catch (e) {
+		log('downloads: overview register failed', String(e));
+	}
+}
+
+/*
+ * Steam's per-game display status (EDisplayStatus). Seen: ELDEN RING sat at 22 with
+ * "installed: true" right after its install was queued, so "installed" alone isn't enough.
+ */
+const DS = {
+	Installing: 3,
+	Validating: 5,
+	Updating: 6,
+	Downloading: 7,
+	ReadyToInstall: 9,
+	UpdatePaused: 17,
+	UpdateQueued: 18,
+	DownloadPaused: 21,
+	DownloadQueued: 22,
+	DownloadRequired: 23,
+} as const;
+/** First install still in progress: not playable yet. */
+const FIRST_INSTALL = new Set<number>([DS.Installing, DS.Downloading, DS.DownloadPaused, DS.DownloadQueued]);
+const NOT_INSTALLED = new Set<number>([DS.ReadyToInstall, DS.DownloadRequired]);
+
+function displayStatus(appid: number): number | null {
+	try {
+		const ov = overview(appid);
+		const v = ov?.local_per_client_data?.display_status ?? ov?.display_status;
+		return typeof v === 'number' ? v : null;
+	} catch {
+		return null;
+	}
+}
+
+function downloadState(appid: number): DownloadState | null {
+	watchDownloads();
+	const ds = displayStatus(appid);
+	const ov = dlOverview;
+	const active = !!ov && Number(ov.update_appid) === appid && String(ov.update_state ?? 'None') !== 'None';
+	// Only real queue entries; the list also holds deferred auto-updates (queue_index -1).
+	const item = dlItems.find((i) => Number(i?.appid) === appid && !i.completed && (i.active || Number(i.queue_index) >= 0));
+	const firstInstall = ds != null && FIRST_INSTALL.has(ds);
+	// Updates for installed games only show while they're actually downloading.
+	if (!active && !firstInstall && !(item && ds != null && FIRST_INSTALL.has(ds))) return null;
+
+	const paused = !!item?.paused || (active && !!ov.paused) || ds === DS.DownloadPaused || ds === DS.UpdatePaused;
+	let phase: DownloadState['phase'];
+	if (paused) phase = 'paused';
+	else if (active) phase = ds === DS.Installing || ds === DS.Validating ? 'installing' : 'downloading';
+	else phase = 'queued';
+
+	let percent: number | null = null;
+	let secondsLeft: number | null = null;
+	let bytesPerSecond: number | null = null;
+	if (active) {
+		const p = Number(ov.overall_percent_complete);
+		if (isFinite(p) && p > 0) percent = p;
+		const left = Number(ov.overall_estimated_time_remaining_sec);
+		if (isFinite(left) && left > 0) secondsLeft = left;
+		bytesPerSecond = Number(ov.update_network_bytes_per_second) || null;
+	}
+	if (percent == null) {
+		const sp = Number(overview(appid)?.local_per_client_data?.status_percentage);
+		if (isFinite(sp) && sp > 0 && phase !== 'queued') percent = sp;
+	}
+	return { phase, percent, bytesPerSecond, secondsLeft };
+}
+
+/* --------------------------- Running games --------------------------- */
+
+let lastLaunchedApp: number | null = null;
+let runningShapeLogged = false;
+
+function runningAppIds(): number[] {
+	try {
+		const ra = (window as any).SteamUIStore?.RunningApps;
+		const list: any[] = Array.isArray(ra) ? ra : ra && typeof ra[Symbol.iterator] === 'function' ? Array.from(ra) : [];
+		if (!runningShapeLogged && list.length) {
+			runningShapeLogged = true;
+			log('running apps', list.slice(0, 2).map((a) => (a && typeof a === 'object' ? Object.keys(a).slice(0, 12) : a)), list.map((a) => a?.appid));
+		}
+		return list.map((a) => Number(a?.appid ?? a)).filter((n) => n > 0);
+	} catch {
+		return [];
+	}
+}
+
+/** 'launching' / 'playing' while Steam is starting or running this game, else null. */
+function runState(appid: number): 'launching' | 'playing' | null {
+	const ds = displayStatus(appid);
+	if (ds === 1) return 'launching'; // EDisplayStatus.Launching
+	if (ds === 4 || runningAppIds().includes(appid)) return 'playing'; // Running
+	return null;
+}
+
+let runningEl: HTMLElement | null = null;
+let runningFor = -1;
+/**
+ * Big Picture's own "game running" screen is empty (just the clock once its top bar is gone),
+ * and it's what you look at while a game starts. Cover it with the game's art and its state.
+ */
+function updateRunningScreen(route: string) {
+	const doc = bpmDoc;
+	if (!doc || !route.toLowerCase().startsWith('/apprunning')) {
+		runningEl?.remove();
+		runningEl = null;
+		runningFor = -1;
+		return;
+	}
+	const appid = runningAppIds()[0] ?? lastLaunchedApp ?? tvGameApp;
+	if (!appid) return;
+	if (!runningEl?.isConnected || runningFor !== appid) {
+		runningEl?.remove();
+		runningFor = appid;
+		const el = doc.createElement('div');
+		el.id = 'tvmode-running';
+		el.style.cssText = 'position:fixed;inset:0;z-index:900;pointer-events:none;background:#0a0c11;color:#fff;overflow:hidden;';
+		const art = heroSources(appid).map((u) => `url("${u}") center top / cover no-repeat`).join(', ');
+		el.innerHTML =
+			`<div style="position:absolute;inset:-3%;background:${art};opacity:.55;filter:saturate(1.1)"></div>` +
+			'<div style="position:absolute;inset:0;background:linear-gradient(0deg, rgba(10,12,17,.97) 0%, rgba(10,12,17,.55) 55%, rgba(10,12,17,.35) 100%)"></div>' +
+			'<div style="position:absolute;left:0;right:0;bottom:16vh;text-align:center;padding:0 10%">' +
+			'<div data-k="name" style="font-size:56px;font-weight:800;line-height:1.1"></div>' +
+			'<div data-k="state" style="margin-top:14px;font-size:24px;font-weight:700;color:#5cb8ff"></div>' +
+			'<div style="margin-top:18px;font-size:17px;color:#9aa4b8">Press the Steam button for game options</div>' +
+			'</div>';
+		doc.body.appendChild(el);
+		runningEl = el;
+	}
+	const name = String(overview(appid)?.display_name ?? '');
+	const state = runState(appid) === 'playing' ? 'Now playing' : 'Launching…';
+	const n = runningEl.querySelector<HTMLElement>('[data-k="name"]');
+	const st = runningEl.querySelector<HTMLElement>('[data-k="state"]');
+	if (n && n.textContent !== name) n.textContent = name;
+	if (st && st.textContent !== state) st.textContent = state;
 }
 
 function overview(appid: number): any {
@@ -1354,7 +2047,7 @@ async function fetchAchievementList(appid: number): Promise<AchievementItem[] | 
 			log('achievement item keys', Object.keys(raw[0]), 'image example:', String(raw[0]?.strImage ?? ''));
 		}
 		if (!raw.length) return null;
-		log('achievements for', appid, raw.length, 'total,', raw.filter((x) => x?.bAchieved).length, 'unlocked');
+		log('achievements for', appid, raw.length, 'total,', raw.filter((x) => x?.bAchieved).length, 'unlocked; global % sample', raw.slice(0, 6).map((x) => [x?.strName, x?.flAchieved]));
 		return raw.map((x, i) => ({
 			id: String(x?.strID ?? x?.id ?? i),
 			name: String(x?.strName ?? x?.name ?? ''),
@@ -1371,9 +2064,34 @@ async function fetchAchievementList(appid: number): Promise<AchievementItem[] | 
 }
 
 /** Steam announcement text (BBCode/HTML) to plain paragraphs. */
+const CLAN_IMAGES = 'https://clan.akamai.steamstatic.com/images';
+/** Marks an image paragraph in a post body: "\u0001img:<url>". */
+const IMG_MARK = '\u0001img:';
+
+function resolveImage(url: string): string {
+	return url.trim().replace(/^\{STEAM_CLAN_IMAGE\}/, CLAN_IMAGES).replace(/^http:\/\//, 'https://');
+}
+
+/** Image URLs in a post, in order (BBCode [img]…[/img], [img src="…"], or HTML <img src="…">). */
+function postImages(raw: string): string[] {
+	const out: string[] = [];
+	const re = /\[img(?:\s+src="([^"]+)")?[^\]]*\]([\s\S]*?)\[\/img\]|<img[^>]*src="([^"]+)"[^>]*>/gi;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(raw))) {
+		const url = (m[1] || m[2] || m[3] || '').trim();
+		if (url && /^(\{STEAM_CLAN_IMAGE\}|https?:)/i.test(url)) out.push(resolveImage(url));
+	}
+	return out;
+}
+
 function plainText(raw: string): string {
 	return raw
-		.replace(/\[img[^\]]*\][\s\S]*?\[\/img\]/gi, '')
+		// Keep images as their own paragraphs; the post view shows them.
+		.replace(/\[img(?:\s+src="([^"]+)")?[^\]]*\]([\s\S]*?)\[\/img\]/gi, (_m, a, b) => {
+			const url = String(a || b || '').trim();
+			return url ? `\n\n${IMG_MARK}${resolveImage(url)}\n\n` : '';
+		})
+		.replace(/<img[^>]*src="([^"]+)"[^>]*>/gi, (_m, a) => `\n\n${IMG_MARK}${resolveImage(String(a))}\n\n`)
 		.replace(/\[previewyoutube[^\]]*\][\s\S]*?\[\/previewyoutube\]/gi, '')
 		.replace(/\[url=[^\]]*\]([\s\S]*?)\[\/url\]/gi, '$1')
 		.replace(/\[\*\]/g, '\n• ')
@@ -1423,6 +2141,7 @@ async function fetchNews(appid: number): Promise<NewsItem[]> {
 			date: Number(n?.date) || 0,
 			label: /patch|update|hotfix|fix/i.test(String(n?.title ?? '')) ? 'Update' : 'News',
 			body: plainText(String(n?.contents ?? '')),
+			image: postImages(String(n?.contents ?? ''))[0] ?? null,
 		}));
 	} catch (e) {
 		log('news failed', appid, String(e));
@@ -1430,17 +2149,76 @@ async function fetchNews(appid: number): Promise<NewsItem[]> {
 	}
 }
 
+let detailsApiLogged = false;
+const detailsLoadedAt = new Map<number, number>();
+
+/**
+ * Steam's own game page registers for the app's details, which loads achievement data with
+ * global percentages. Our TV page skips that page, so do the same registration here.
+ */
+function loadSteamAppDetails(appid: number) {
+	const store = (window as any).appDetailsStore;
+	if (!detailsApiLogged) {
+		detailsApiLogged = true;
+		const names = new Set<string>(Object.keys(store ?? {}));
+		let p = store ? Object.getPrototypeOf(store) : null;
+		for (let i = 0; p && i < 3; i++, p = Object.getPrototypeOf(p)) Object.getOwnPropertyNames(p).forEach((n) => names.add(n));
+		log('appDetailsStore', store ? Array.from(names).filter((n) => /regist|request|achiev|load|fetch/i.test(n)) : 'missing');
+	}
+	const last = detailsLoadedAt.get(appid) ?? 0;
+	if (Date.now() - last < 60000) return;
+	detailsLoadedAt.set(appid, Date.now());
+	try {
+		const sub = store?.RegisterForAppData?.(appid, () => {});
+		// Keep the registration alive long enough for the data (and global %) to arrive.
+		setTimeout(() => {
+			try {
+				if (typeof sub === 'function') sub();
+				else sub?.unregister?.();
+			} catch {
+				/* ignore */
+			}
+		}, 30000);
+		setTimeout(() => {
+			try {
+				const ach = store?.GetAchievements?.(appid);
+				const sample = [...(ach?.vecHighlight ?? []), ...(ach?.vecUnachieved ?? [])].slice(0, 4).map((a: any) => [a?.strName, a?.flAchieved]);
+				log('steam details for', appid, sub ? 'registered' : 'no RegisterForAppData', 'global % sample', sample);
+			} catch (e) {
+				log('steam details check failed', String(e));
+			}
+		}, 3000);
+	} catch (e) {
+		log('steam details load failed', appid, String(e));
+	}
+}
+
 const TvGamePage = makeTvGame({
-	onMount: (appid) => log('game page created', appid),
+	debug: (...a) => log(...a),
+	onMount: (appid) => {
+		log('game page created', appid);
+		loadSteamAppDetails(appid);
+	},
 	news: getNews,
 	currentApp: currentGameApp,
 	gameName: (appid) => String(overview(appid)?.display_name ?? 'Game'),
-	isInstalled: (appid) => {
-		const ov = overview(appid);
-		const v = ov?.installed ?? ov?.local_per_client_data?.installed;
-		return typeof v === 'boolean' ? v : null;
-	},
+	isInstalled: (appid) => installedHere(appid),
 	play: (appid) => {
+		logPrimaryPress('play', appid);
+		if (downloadState(appid)) {
+			openDownloadsScreen();
+			return;
+		}
+		if (installedHere(appid) === false) {
+			openInstall(appid);
+			return;
+		}
+		if (runState(appid)) {
+			log('already running', appid);
+			return;
+		}
+		playUiSound('launch');
+		lastLaunchedApp = appid;
 		try {
 			(window as any).SteamClient?.Apps?.RunGame?.(String(appid), '', -1, 100);
 			log('launching', appid);
@@ -1449,14 +2227,16 @@ const TvGamePage = makeTvGame({
 		}
 	},
 	install: (appid) => {
-		try {
-			(window as any).SteamClient?.Installs?.OpenInstallWizard?.([appid]);
-		} catch (e) {
-			log('install failed', appid, String(e));
-		}
+		logPrimaryPress('install', appid);
+		if (downloadState(appid)) openDownloadsScreen();
+		else openInstall(appid);
 	},
+	download: (appid) => downloadState(appid),
+	running: (appid) => runState(appid),
+	openDownloads: () => openDownloadsScreen(),
 	back: () =>
 		setTimeout(() => {
+			playUiSound('outOfGame');
 			try {
 				gamepadWindow()?.Navigate(TV_ROUTE, true);
 			} catch {
@@ -1465,9 +2245,22 @@ const TvGamePage = makeTvGame({
 		}, 0),
 	achievementList: getAchievementList,
 	achievementIcon,
-	controllerLayout: (appid) => navigatorAction('controller layout', appid, /controller|configurator|steaminput/i),
-	properties: (appid) => navigatorAction('properties', appid, /propert/i),
-	openAchievements: (appid) => navigatorAction('achievements', appid, /^MyAchievements$/),
+	controllerLayout: (appid) => {
+		playUiSound('activate');
+		navigatorAction('controller layout', appid, /controller|configurator|steaminput/i);
+	},
+	properties: (appid) => {
+		playUiSound('activate');
+		navigatorAction('properties', appid, /propert/i);
+	},
+	sound: () => playUiSound('activate'),
+	openAchievements: (appid) => {
+		playUiSound('activate');
+		// Make sure Steam has the full details first, then open its achievements page.
+		const fresh = Date.now() - (detailsLoadedAt.get(appid) ?? 0) > 60000;
+		loadSteamAppDetails(appid);
+		setTimeout(() => navigatorAction('achievements', appid, /^MyAchievements$/), fresh ? 800 : 0);
+	},
 	stockIcon: (name) => stockIcons[name] ?? null,
 });
 
@@ -1686,7 +2479,17 @@ function tryCaptureAchievementIcon() {
 
 const desktopLock = createDesktopLock(log, steamWindows, () => (window as any).SteamUIStore?.WindowStore?.MainWindowInstance);
 
-const TvHome = makeTvHome(readTvRows, openGame, getAchievements, achievementIcon);
+/** Carousel status line: download progress, "Not Installed", or nothing when it's ready to play. */
+function tileStatus(appid: number): { text: string; active: boolean } | null {
+	const r = runState(appid);
+	if (r) return { text: r === 'playing' ? 'Playing' : 'Launching…', active: true };
+	const d = downloadState(appid);
+	if (d) return { text: downloadLabel(d).main, active: d.phase === 'downloading' || d.phase === 'installing' };
+	if (installedHere(appid) === false) return { text: 'Not Installed', active: false };
+	return null;
+}
+
+const TvHome = makeTvHome(readTvRows, openGame, getAchievements, achievementIcon, tileStatus);
 
 function methodNames(o: any): string[] {
 	const names = new Set<string>(Object.keys(o ?? {}));
@@ -1731,7 +2534,13 @@ function start() {
 	registerTvRoute();
 	if (CONFIG.lockdown) {
 		try {
-			startMenuInjector(log, Array.from(MAIN_MENU_ALLOWED), Array.from(MAIN_MENU_KNOWN));
+			startMenuInjector(
+				log,
+				Array.from(MAIN_MENU_ALLOWED),
+				Array.from(MAIN_MENU_KNOWN),
+				GAME_MENU_HIDDEN,
+				PLAYTIME_TEXT.map((re) => re.source),
+			);
 		} catch (e) {
 			log('menu injector failed to start', String(e));
 		}

@@ -1,7 +1,7 @@
 [plugin]
 id = "com.zach.tvmode"
 name = "TV Mode"
-version = "0.10.1"
+version = "0.14.7"
 author = "Zach-Houston"
 description = "Big Picture TV mode: shows only collections whose names start with 'TV' and hides playtime / last played."
 

@@ -1,5 +1,5 @@
 import { Focusable } from 'millennium';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 /* ------------------------------------------------------------------ *
  * TV Home: the custom Big Picture screen at /tvmode.
@@ -26,7 +26,7 @@ const F = Focusable as any;
 
 export const CSS = `
 .tvm-root { position: absolute; inset: 0; background: radial-gradient(ellipse at 50% 0%, #1b2233 0%, #0a0c11 70%); color: #fff; overflow: hidden; }
-.tvm-rows { position: relative; z-index: 1; height: 100%; overflow-y: auto; scroll-snap-type: y mandatory; scroll-behavior: smooth; }
+.tvm-rows { position: relative; z-index: 1; height: 100%; overflow-y: auto; }
 .tvm-bg { position: absolute; inset: 0; overflow: hidden; z-index: 0; }
 .tvm-bg-layer { position: absolute; inset: -4%; background-size: cover; background-position: center top; opacity: 0;
 	animation: tvm-fade .7s ease forwards, tvm-drift 28s ease-in-out infinite alternate; will-change: transform, opacity; }
@@ -41,12 +41,21 @@ export const CSS = `
 .tvm-row:not(:focus-within) { opacity: .35; }
 .tvm-title { margin: 0 0 8px 72px; font-size: 44px; font-weight: 700; letter-spacing: .3px; }
 .tvm-count { margin: 0 0 0 72px; font-size: 18px; opacity: .55; }
-.tvm-strip { display: flex; align-items: center; gap: 32px; overflow-x: auto; padding: 56px 50vw 72px 72px; scroll-behavior: smooth; }
+/* Bottom padding holds the info below the selected cover: name + status + achievements (~97px),
+   scaled 1.16 with the tile, plus the cover's own growth (~28px) ≈ 140px. The strip scrolls, so
+   anything past its padding is clipped. */
+.tvm-strip { display: flex; align-items: center; gap: 32px; overflow-x: auto; padding: 56px 50vw 156px 72px; }
 .tvm-tile { flex: 0 0 auto; width: 230px; outline: none; border-radius: 10px; transition: transform .18s ease; transform-origin: center; }
 .tvm-tile::before, .tvm-tile::after { display: none !important; }
 .tvm-art { width: 100%; aspect-ratio: 2 / 3; border-radius: 10px; overflow: hidden; background: #1c2230; box-shadow: 0 10px 30px rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; text-align: center; padding: 0; }
 .tvm-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tvm-art .tvm-fallback { padding: 16px; font-size: 20px; font-weight: 600; opacity: .85; }
+/* Name, status and achievements hang below the cover without taking layout space, so a status
+   line appearing on one game never shifts the covers. */
+.tvm-tile { position: relative; }
+.tvm-info { position: absolute; left: 0; right: 0; top: 100%; }
+.tvm-status { margin-top: 4px; font-size: 16px; font-weight: 600; text-align: center; color: #9aa4b8; white-space: nowrap; }
+.tvm-status--active { color: #5cb8ff; }
 .tvm-name { margin-top: 16px; font-size: 20px; font-weight: 600; text-align: center; opacity: 0; transition: opacity .18s ease; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tvm-tile.gpfocus, .tvm-tile:focus, .tvm-tile:focus-visible { transform: scale(1.16); z-index: 1; }
 .tvm-tile.gpfocus .tvm-art, .tvm-tile:focus .tvm-art { box-shadow: 0 0 0 4px #fff, 0 18px 50px rgba(0,0,0,.7); }
@@ -98,14 +107,56 @@ const Art = ({ game }: { game: TvGame }) => {
 	);
 };
 
+/*
+ * The "camera". Each focus change sets a new target and one animation loop per scroller eases
+ * towards it, so holding left/right keeps up instead of restarting a smooth scroll every step.
+ */
+const FOLLOW_RATE = 0.28; // share of the remaining distance covered per 60 Hz frame
+const scrollAnims = new WeakMap<HTMLElement, { target: number; running: boolean }>();
+
+function scrollTowards(el: HTMLElement, axis: 'x' | 'y', target: number) {
+	const max = axis === 'x' ? el.scrollWidth - el.clientWidth : el.scrollHeight - el.clientHeight;
+	target = Math.max(0, Math.min(max, Math.round(target)));
+	let a = scrollAnims.get(el);
+	if (!a) scrollAnims.set(el, (a = { target, running: false }));
+	a.target = target;
+	if (a.running) return;
+	a.running = true;
+	const win = el.ownerDocument?.defaultView ?? window;
+	let last = win.performance.now();
+	const step = (now: number) => {
+		const anim = scrollAnims.get(el)!;
+		const dt = Math.min(64, now - last);
+		last = now;
+		const cur = axis === 'x' ? el.scrollLeft : el.scrollTop;
+		const diff = anim.target - cur;
+		if (!el.isConnected || Math.abs(diff) < 1) {
+			if (el.isConnected) axis === 'x' ? (el.scrollLeft = anim.target) : (el.scrollTop = anim.target);
+			anim.running = false;
+			return;
+		}
+		const k = 1 - Math.pow(1 - FOLLOW_RATE, dt / 16.7);
+		const next = cur + diff * k;
+		if (axis === 'x') el.scrollLeft = next;
+		else el.scrollTop = next;
+		win.requestAnimationFrame(step);
+	};
+	win.requestAnimationFrame(step);
+}
+
 /** Keep the focused tile centred and its row on screen. */
 function centre(e: any) {
-	const el: HTMLElement | undefined = e?.currentTarget ?? e?.target;
-	try {
-		el?.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'smooth' });
-	} catch {
-		/* ignore */
-	}
+	const tile: HTMLElement | undefined = e?.currentTarget ?? e?.target;
+	const strip = tile?.closest?.('.tvm-strip') as HTMLElement | null;
+	const row = tile?.closest?.('.tvm-row') as HTMLElement | null;
+	const rows = tile?.closest?.('.tvm-rows') as HTMLElement | null;
+	if (!tile || !strip || !row || !rows) return;
+	// Rects are measured at the current (possibly mid-animation) scroll, so current + offset is absolute.
+	const t = tile.getBoundingClientRect();
+	const sr = strip.getBoundingClientRect();
+	scrollTowards(strip, 'x', strip.scrollLeft + (t.left + t.width / 2 - (sr.left + sr.width / 2)));
+	const rr = rows.getBoundingClientRect();
+	scrollTowards(rows, 'y', rows.scrollTop + (row.getBoundingClientRect().top - rr.top));
 }
 
 /** Stops B on the home screen from walking back into a blocked screen. */
@@ -179,7 +230,7 @@ const AchievementLine = ({ a, icon }: { a: Achievements | null | undefined; icon
 };
 
 /** Wide hero art (the banner on a game's page), best source first. */
-function heroSources(appid: number): string[] {
+export function heroSources(appid: number): string[] {
 	return [
 		`https://steamloopback.host/assets/${appid}/library_hero.jpg`,
 		`https://shared.steamstatic.com/store_item_assets/steam/apps/${appid}/library_hero.jpg`,
@@ -242,9 +293,24 @@ interface TileProps {
 	getAchievements: GetAchievements;
 	achievementIcon: () => string | null;
 	onFocusGame: (appid: number) => void;
+	focused: boolean;
+	gameStatus: GameStatus;
 }
 
-const Tile = ({ game, autoFocus, openGame, getAchievements, achievementIcon, onFocusGame }: TileProps) => {
+export type GameStatus = (appid: number) => { text: string; active: boolean } | null;
+
+/** Install/download status of the selected game, refreshed every second while it's selected. */
+const StatusLine = ({ appid, gameStatus }: { appid: number; gameStatus: GameStatus }) => {
+	const [st, setSt] = useState(() => gameStatus(appid));
+	useEffect(() => {
+		const t = setInterval(() => setSt(gameStatus(appid)), 1000);
+		return () => clearInterval(t);
+	}, [appid]);
+	if (!st) return null;
+	return <div className={'tvm-status' + (st.active ? ' tvm-status--active' : '')}>{st.text}</div>;
+};
+
+const Tile = ({ game, autoFocus, openGame, getAchievements, achievementIcon, onFocusGame, focused: isFocused, gameStatus }: TileProps) => {
 	const focused = (e: any) => {
 		centre(e);
 		onFocusGame(game.appid);
@@ -260,12 +326,15 @@ const Tile = ({ game, autoFocus, openGame, getAchievements, achievementIcon, onF
 			onGamepadFocus={focused}
 			onFocus={focused}
 		>
-			<div className="tvm-art-wrap">
+			<div className="tvm-art-wrap" data-tvm-app={game.appid}>
 				<Art game={game} />
 				{perfect && <span className="tvm-perfect" dangerouslySetInnerHTML={{ __html: FALLBACK_PERFECT }} />}
 			</div>
-			<div className="tvm-name">{game.name}</div>
-			<AchievementLine a={a} icon={achievementIcon} />
+			<div className="tvm-info">
+				<div className="tvm-name">{game.name}</div>
+				{isFocused && <StatusLine appid={game.appid} gameStatus={gameStatus} />}
+				<AchievementLine a={a} icon={achievementIcon} />
+			</div>
 		</F>
 	);
 };
@@ -278,6 +347,7 @@ export function makeTvHome(
 	openGame: (appid: number) => void,
 	getAchievements: GetAchievements,
 	achievementIcon: () => string | null,
+	gameStatus: GameStatus,
 ) {
 	return function TvHome() {
 		const [rows, setRows] = useState<TvRow[]>(readRows);
@@ -288,14 +358,34 @@ export function makeTvHome(
 			return known ? lastSelectedApp : (rows0[0]?.games[0]?.appid ?? null);
 		});
 		const [focusedApp, setFocusedApp] = useState<number | null>(startApp);
-		// Bring the remembered game into view once Steam has focused it.
+		// Put the remembered game in the centre before the first paint, so coming back from a
+		// game page shows it in place instead of scrolling over to it.
 		const rootRef = useRef<HTMLDivElement | null>(null);
-		useEffect(() => {
-			const t = setTimeout(() => {
-				const el = rootRef.current?.querySelector('.tvm-tile.gpfocus, .tvm-tile:focus') as HTMLElement | null;
-				el?.scrollIntoView?.({ block: 'center', inline: 'center' });
-			}, 150);
-			return () => clearTimeout(t);
+		useLayoutEffect(() => {
+			const root = rootRef.current;
+			if (!root || startApp == null) return;
+			const mark = root.querySelector(`[data-tvm-app="${startApp}"]`);
+			const tile = mark?.closest<HTMLElement>('.tvm-tile') ?? (mark as HTMLElement | null);
+			const strip = tile?.closest<HTMLElement>('.tvm-strip');
+			const row = tile?.closest<HTMLElement>('.tvm-row');
+			const rowsEl = root.querySelector<HTMLElement>('.tvm-rows');
+			if (!tile || !strip || !row || !rowsEl) return;
+			const jump = (el: HTMLElement, fn: () => void) => {
+				const prev = el.style.scrollBehavior;
+				el.style.scrollBehavior = 'auto';
+				fn();
+				requestAnimationFrame(() => {
+					el.style.scrollBehavior = prev;
+				});
+			};
+			jump(rowsEl, () => {
+				rowsEl.scrollTop += row.getBoundingClientRect().top - rowsEl.getBoundingClientRect().top;
+			});
+			jump(strip, () => {
+				const t = tile.getBoundingClientRect();
+				const s = strip.getBoundingClientRect();
+				strip.scrollLeft += t.left + t.width / 2 - (s.left + s.width / 2);
+			});
 		}, []);
 		const onFocusGame = (appid: number) => {
 			lastSelectedApp = appid;
@@ -334,6 +424,8 @@ export function makeTvHome(
 										getAchievements={getAchievements}
 										achievementIcon={achievementIcon}
 										onFocusGame={onFocusGame}
+										focused={g.appid === focusedApp}
+										gameStatus={gameStatus}
 									/>
 								))}
 							</F>
